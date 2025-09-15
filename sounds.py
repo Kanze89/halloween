@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
-import serial, time, os, random, subprocess, glob
+import serial, time, subprocess
 from pathlib import Path
 
-PORT = "/dev/serial0"        # Pi's UART
-BAUD = 921600                # Use NAssistant to lower if needed (e.g., 230400)
-TRIGGER_CM = 120             # fire when closer than this
-RELEASE_CM = 150             # must move back past this to re-arm
-COOLDOWN = 6.0               # seconds between scares
-SOUNDS_DIR = Path("/home/pi/halloween/sounds")
-AUDIO_DEVICE = None          # e.g., "hw:1,0" for USB DAC; None=default
+# --- SETTINGS ---
+PORT = "/dev/serial0"        # Pi UART port
+BAUD = 921600                # default for Nooploop
+TRIGGER_CM = 120             # trigger distance
+RELEASE_CM = 150             # re-arm distance
+COOLDOWN = 5.0               # seconds between plays
+AUDIO_DEVICE = None          # e.g., "hw:1,0" for USB, or None = default
 
-HDR = bytes([0x57, 0x00, 0xFF, 0x00])  # Nooploop TOFSense UART frame header
+# path to your witch laugh file
+SOUND_FILE = Path("/home/upi/halloween/sounds/witch_laugh.mp3")
+
+# Nooploop frame constants
+HDR = bytes([0x57, 0x00, 0xFF, 0x00])
 FRAME_LEN = 16
 
-def play_sound(path):
+def play_sound():
     cmd = ["mpg123", "-q"]
-    if AUDIO_DEVICE: cmd += ["-a", AUDIO_DEVICE]
-    cmd.append(str(path))
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if AUDIO_DEVICE:
+        cmd += ["-a", AUDIO_DEVICE]
+    cmd.append(str(SOUND_FILE))
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def read_frame(ser):
-    # sync to header
     while True:
         b = ser.read(1)
         if not b: return None
@@ -30,30 +34,23 @@ def read_frame(ser):
                 payload = ser.read(FRAME_LEN - 4)
                 if len(payload) == FRAME_LEN - 4:
                     frame = HDR + payload
-                    # checksum = low byte of sum of first 15 bytes
                     if (sum(frame[:-1]) & 0xFF) == frame[-1]:
                         return frame
-                # if fail, continue searching
 
 def parse_distance_cm(frame):
-    # bytes layout from example doc:
-    # 0-3: header, 4: reserved, 5: id, 6-9: system_time (u32 le)
-    # 10-12: distance_u24 (little endian), 13: status, 14-15: signal (u16 le), 16: sum (but frame is 16 bytes total, index 15 is sum)
-    # Our 16-byte frame indexes: 0..15, with checksum at 15
-    # distance_u24 starts at index 10 in the example PDF
     d0, d1, d2 = frame[10], frame[11], frame[12]
     dist_u24 = d0 | (d1 << 8) | (d2 << 16)
-    # Empirically this is distance in millimeters (see example decoding 0x00 0x08 0xAD -> 2221 mm ≈ 2.221 m)
-    # Return centimeters:
-    return dist_u24 / 10.0  # mm -> cm
+    return dist_u24 / 10.0  # mm → cm
 
 def main():
-    files = sorted([p for p in SOUNDS_DIR.glob("*") if p.suffix.lower() in (".mp3",".wav")])
-    if not files: raise SystemExit(f"Put some MP3/WAV files in {SOUNDS_DIR}")
+    if not SOUND_FILE.exists():
+        raise SystemExit(f"Sound file missing: {SOUND_FILE}")
+
     ser = serial.Serial(PORT, BAUD, timeout=1)
     last = 0.0
     armed = True
-    print("Listening for Nooploop TOF frames…")
+    print("Witch laugh scare ready...")
+
     try:
         while True:
             f = read_frame(ser)
@@ -61,13 +58,11 @@ def main():
             dist_cm = parse_distance_cm(f)
             status = f[13]
             if status != 0:
-                # ignore invalid/weak signal frames
                 continue
             now = time.time()
             if armed and dist_cm <= TRIGGER_CM and (now - last) >= COOLDOWN:
-                snd = random.choice(files)
-                print(f"TRIGGER @ {dist_cm:.0f} cm → {snd.name}")
-                play_sound(snd)
+                print(f"TRIGGER @ {dist_cm:.0f} cm → Witch Laugh!")
+                play_sound()
                 last = now
                 armed = False
             if not armed and dist_cm >= RELEASE_CM:
