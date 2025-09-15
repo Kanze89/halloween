@@ -8,39 +8,36 @@ from pathlib import Path
 from collections import deque
 
 # ---------- USER CONFIG ----------
-# Serial: try GPIO UART first, then USB-TTL
 PORTS        = ["/dev/serial0", "/dev/ttyUSB0"]
-BAUDS        = [921600, 460800, 230400, 115200]   # includes 460800 (some firmwares)
+BAUDS        = [921600, 460800, 230400, 115200]
 
-# Media (MP4 recommended; mpv also plays MP3/WAV)
 MEDIA_FILE   = Path("/home/upi/halloween/sounds/video.mp4")
-SHOW_VIDEO   = True                  # True = show video; False = audio-only
-FULLSCREEN   = True                  # fullscreen when SHOW_VIDEO=True
-MPV_AUDIO_DEVICE = "alsa/plughw:1,0" # set from `mpv --audio-device=help`, or None for default
-MPV_VOLUME   = 100                   # 0..130 (mpv allows boost)
-FORCE_DRM    = False                 # True if running headless (no desktop), renders straight to HDMI
+SHOW_VIDEO   = True
+FULLSCREEN   = True
+MPV_AUDIO_DEVICE = None      # <-- let mpv choose the same default that works for you
+MPV_VOLUME   = 110           # 0..130 (boost if you need)
+FORCE_DRM    = False         # True if no desktop/X running; renders direct to HDMI
 
 # Zone: ONLY trigger when inside 1 mm .. 1 m (0.1..100 cm)
 ZONE_MIN_CM  = 0.1
 ZONE_MAX_CM  = 100.0
 
 # Trigger behavior
-ENTER_FRAMES = 2           # consecutive in-zone frames required to fire
-COOLDOWN_AFTER_END = 0.4   # brief pause after video ends (seconds)
+ENTER_FRAMES = 2
+COOLDOWN_AFTER_END = 0.4
 
-# Filters (start forgiving; tighten later when stable)
-MIN_SIGNAL   = 0           # set to ~15–30 once confirmed working
-MIN_CM       = 0.1         # hard lower clamp (1 mm)
-MAX_CM       = 105.0       # hard upper clamp slightly above 1 m
-EMA_ALPHA    = 0.5         # higher = snappier response
-MED_WIN      = 3           # smaller window = less lag
-DEBUG_EVERY  = 1           # print every frame; set 0 when done tuning
+# Filters
+MIN_SIGNAL   = 0
+MIN_CM       = 0.1
+MAX_CM       = 105.0
+EMA_ALPHA    = 0.5
+MED_WIN      = 3
+DEBUG_EVERY  = 1
 # ---------------------------------
 
 HDR        = 0x57
 FRAME_LEN  = 16
 
-# ---------- MEDIA PLAYBACK ----------
 def play_media_and_wait():
     """Launch mpv, BLOCK until it finishes (no re-triggers while playing)."""
     if not MEDIA_FILE.exists():
@@ -51,37 +48,24 @@ def play_media_and_wait():
         return
 
     cmd = ["mpv", "--no-config", "--no-terminal", "--really-quiet", f"--volume={MPV_VOLUME}"]
-    if MPV_AUDIO_DEVICE:
-        cmd += [f"--audio-device={MPV_AUDIO_DEVICE}"]
+    # do NOT force --audio-device unless you must. Let mpv pick the default that works.
     if SHOW_VIDEO:
         if FULLSCREEN:
             cmd += ["--fs"]
         if FORCE_DRM:
-            # render directly to HDMI when no desktop is running
             cmd += ["--vo=gpu", "--gpu-context=drm"]
     else:
         cmd += ["--no-video"]
 
     cmd.append(str(MEDIA_FILE))
 
-    # Try to target the desktop display if SHOW_VIDEO and not forcing DRM
     env = os.environ.copy()
     if SHOW_VIDEO and not FORCE_DRM and "DISPLAY" not in env:
         env["DISPLAY"] = ":0"
 
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, check=False)
-    except Exception as e:
-        print(f"[ERR] mpv run failed: {e}")
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, check=False)
 
-# ---------- TOFSense FRAME UTILS ----------
 def sync_and_read_frame(ser, timeout=1.0):
-    """
-    Sync to a valid 16-byte TOFSense frame:
-      [0]=0x57, [1]=func_mark (0x00/0x01), [2]=0xFF, [3]=id,
-      [4..7]=time, [8..10]=distance(int24LE m*1000), [11]=status,
-      [12..13]=signal(u16LE), [14]=reserved, [15]=checksum(low-byte sum[0..14])
-    """
     t0 = time.time()
     while time.time() - t0 < timeout:
         b = ser.read(1)
@@ -102,7 +86,6 @@ def sync_and_read_frame(ser, timeout=1.0):
     return None
 
 def parse_dist_cm(frame, offset):
-    # distance is int24 little-endian of meters*1000 -> convert to cm
     d0, d1, d2 = frame[offset], frame[offset+1], frame[offset+2]
     return (d0 | (d1 << 8) | (d2 << 16)) / 10.0  # mm -> cm
 
@@ -113,11 +96,6 @@ def fields(frame, offset):
     return dist_cm, status, signal
 
 def try_open_and_autoconfig():
-    """
-    1) Scan ports/bauds. Only accept lock after >=5 valid frames in ~3 s.
-    2) Auto-choose distance offset: 8 vs 10 (firmware variants).
-       Score = count of plausible frames (0.1..500 cm, st==0); tiebreaker = lower variance.
-    """
     for port in PORTS:
         for baud in BAUDS:
             try:
@@ -161,7 +139,6 @@ def try_open_and_autoconfig():
                 except Exception: pass
     return None, None
 
-# ---------- MAIN LOOP ----------
 def main():
     if not MEDIA_FILE.exists():
         raise SystemExit(f"Media file missing: {MEDIA_FILE}")
@@ -183,7 +160,6 @@ def main():
 
             dist_cm, status, signal = fields(fr, dist_offset)
 
-            # hard gates
             if status != 0 or dist_cm < MIN_CM or dist_cm > MAX_CM:
                 in_count = 0
                 continue
@@ -191,7 +167,6 @@ def main():
                 in_count = 0
                 continue
 
-            # smoothing: median -> EMA
             medbuf.append(dist_cm)
             med = statistics.median(medbuf) if medbuf else dist_cm
             ema = med if ema is None else (EMA_ALPHA * med + (1 - EMA_ALPHA) * ema)
@@ -201,15 +176,11 @@ def main():
                 print(f"[DBG] raw={dist_cm:6.2f}cm  med={med:6.2f}  ema={smoothed:6.2f}  sig={signal:4d}  st={status}")
             dbg += 1
 
-            # in-zone counting
             if ZONE_MIN_CM <= smoothed <= ZONE_MAX_CM:
                 in_count += 1
                 if in_count >= ENTER_FRAMES:
                     print(f"[TRIGGER] {smoothed:.1f} cm → Play MP4 (blocking)")
-                    # Block here until the video completes. While playing, do NOTHING.
                     play_media_and_wait()
-
-                    # After mpv exits: flush serial input, brief cooldown, then resume sensing
                     try:
                         ser.reset_input_buffer()
                     except Exception:
@@ -225,7 +196,6 @@ def main():
     finally:
         try: ser.close()
         except Exception: pass
-
 
 if __name__ == "__main__":
     main()
