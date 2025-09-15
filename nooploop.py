@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
-# Nooploop TOFSense -> Witch Laugh (1m zone) with robust lock + auto offset
+# Nooploop TOFSense -> Witch Laugh (1 mm .. 1 m zone), robust lock + auto offset
 
 import serial, time, subprocess, statistics
 from pathlib import Path
 from collections import deque
 
 # ---------- USER CONFIG ----------
-PORTS        = ["/dev/serial0", "/dev/ttyUSB0"]   # GPIO UART first, then USB-TTL
+PORTS        = ["/dev/serial0", "/dev/ttyUSB0"]   # try GPIO UART first, then USB-TTL
 BAUDS        = [921600, 460800, 230400, 115200]   # include 460800 (some firmwares)
 AUDIO_DEVICE = "hw:1,0"                            # from `aplay -l` (or None for default)
-SOUND_FILE   = Path("/home/upi/halloween/sounds/witch_laugh.mp3")
+SOUND_FILE   = Path("/home/pi/halloween/sounds/witch_laugh.mp3")
 
-# 1-meter zone
-ZONE_MIN_CM  = 35
-ZONE_MAX_CM  = 100
-ENTER_FRAMES = 3
-EXIT_FRAMES  = 3
-COOLDOWN_SEC = 5.0
+# ZONE: ONLY trigger when someone is inside 1 mm .. 1 m
+ZONE_MIN_CM  = 0.1    # 1 mm = 0.1 cm
+ZONE_MAX_CM  = 100.0  # 1 m = 100 cm
+ENTER_FRAMES = 3      # need N consecutive in-zone frames to fire
+EXIT_FRAMES  = 3      # need N consecutive out-of-zone frames to re-arm
+COOLDOWN_SEC = 5.0    # minimum seconds between scares
 
-# Filters (start forgiving; tighten later)
-MIN_SIGNAL   = 0        # start at 0 while testing; set 15–30 once stable
-MIN_CM       = 20
-MAX_CM       = 160      # ignore anything farther than ~1.6 m
-EMA_ALPHA    = 0.35
-MED_WIN      = 5
-DEBUG_EVERY  = 1        # print every frame; set 0 later
+# Filters (start forgiving; tighten later if noisy)
+MIN_SIGNAL   = 0      # start at 0 while testing; set ~15–30 once stable
+MIN_CM       = 0.1    # hard lower clamp (1 mm) so math stays sane
+MAX_CM       = 105.0  # hard upper clamp slightly above 1 m
+EMA_ALPHA    = 0.35   # smoothing: higher = snappier
+MED_WIN      = 5      # median window length (odd numbers best)
+DEBUG_EVERY  = 1      # print every frame; set 0 later
 # ---------------------------------
 
 HDR        = 0x57
 FRAME_LEN  = 16
-OFFSETS    = [8, 10]    # try both distance byte positions
 
 def play_sound():
     if not SOUND_FILE.exists():
@@ -63,7 +62,8 @@ def sync_and_read_frame(ser, timeout=1.0):
 
 def parse_dist_cm(frame, offset):
     d0, d1, d2 = frame[offset], frame[offset+1], frame[offset+2]
-    return (d0 | (d1 << 8) | (d2 << 16)) / 10.0  # mm -> cm (meters*1000 → cm)
+    # distance is int24 little-endian of meters*1000 → convert to cm
+    return (d0 | (d1 << 8) | (d2 << 16)) / 10.0  # mm → cm
 
 def fields(frame, offset):
     dist_cm = parse_dist_cm(frame, offset)
@@ -73,9 +73,9 @@ def fields(frame, offset):
 
 def try_open_and_autoconfig():
     """
-    Lock only after >=5 valid frames; then auto-choose distance offset (8 vs 10)
-    by counting how many frames land in a plausible human range (20..500 cm)
-    with status==0. Tie-breaker = lower variance.
+    1) Scan ports/bauds. Only accept lock after >=5 valid frames in ~3 s.
+    2) Auto-choose distance offset: 8 vs 10 (firmware variants).
+       Score = count of plausible human-range frames (0.1..500 cm, st==0), tiebreaker = lower variance.
     """
     for port in PORTS:
         for baud in BAUDS:
@@ -83,7 +83,7 @@ def try_open_and_autoconfig():
                 ser = serial.Serial(port, baudrate=baud, timeout=0.2)
                 frames = []
                 t0 = time.time()
-                while time.time() - t0 < 3.0 and len(frames) < 12:
+                while time.time() - t0 < 3.0 and len(frames) < 14:
                     f = sync_and_read_frame(ser, timeout=0.5)
                     if f:
                         frames.append(f)
@@ -91,12 +91,11 @@ def try_open_and_autoconfig():
                     ser.close()
                     continue
 
-                # choose offset
                 def score(off):
                     vals = []
                     for fr in frames:
                         d, st, _ = fields(fr, off)
-                        if 20 <= d <= 500 and st == 0:
+                        if 0.1 <= d <= 500 and st == 0:
                             vals.append(d)
                     if not vals:
                         return (0, float("inf"))
@@ -110,7 +109,6 @@ def try_open_and_autoconfig():
                 elif s10 > s8:
                     offset = 10
                 else:
-                    # if equal counts, pick the one with smaller variance
                     offset = 8 if s8[1] <= s10[1] else 10
 
                 fid = frames[0][3]
@@ -143,9 +141,10 @@ def main():
             fr = sync_and_read_frame(ser, timeout=1.0)
             if not fr:
                 continue
+
             dist_cm, status, signal = fields(fr, dist_offset)
 
-            # gate junk lightly while testing
+            # hard gates
             if status != 0 or dist_cm < MIN_CM or dist_cm > MAX_CM:
                 in_count = 0
                 continue
@@ -153,14 +152,14 @@ def main():
                 in_count = 0
                 continue
 
-            # smoothing
+            # smoothing: median → EMA
             medbuf.append(dist_cm)
             med = statistics.median(medbuf) if medbuf else dist_cm
             ema = med if ema is None else (EMA_ALPHA * med + (1 - EMA_ALPHA) * ema)
             smoothed = ema
 
             if DEBUG_EVERY and (dbg % DEBUG_EVERY == 0):
-                print(f"[DBG] raw={dist_cm:6.1f} med={med:6.1f} ema={smoothed:6.1f} sig={signal:4d} st={status}")
+                print(f"[DBG] raw={dist_cm:6.2f} cm  med={med:6.2f}  ema={smoothed:6.2f}  sig={signal:4d}  st={status}")
             dbg += 1
 
             now = time.time()
@@ -170,7 +169,7 @@ def main():
                 if inside:
                     in_count += 1
                     if in_count >= ENTER_FRAMES and (now - last_play) >= COOLDOWN_SEC:
-                        print(f"[TRIGGER] {smoothed:.0f} cm in zone ({ZONE_MIN_CM}-{ZONE_MAX_CM}) → Witch Laugh")
+                        print(f"[TRIGGER] {smoothed:.1f} cm in zone ({ZONE_MIN_CM}-{ZONE_MAX_CM}) → Witch Laugh")
                         play_sound()
                         last_play = now
                         armed = False
@@ -179,6 +178,7 @@ def main():
                 else:
                     in_count = 0
             else:
+                # re-arm only after consecutively outside zone
                 if not inside:
                     out_count += 1
                     if out_count >= EXIT_FRAMES:
