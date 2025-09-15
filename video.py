@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Nooploop TOFSense -> MP4 scare player (blocks until video ends, then resume sensing)
+# Nooploop TOFSense -> MP4 scare player (blocks until video ends, then resumes sensing)
+# User: upi | Media: /home/upi/halloween/sounds/video.mp4
 # Zone: 1 mm .. 1 m, robust port/baud lock, auto distance offset
 
 import serial, time, subprocess, statistics, shutil, os
@@ -9,14 +10,15 @@ from collections import deque
 # ---------- USER CONFIG ----------
 # Serial: try GPIO UART first, then USB-TTL
 PORTS        = ["/dev/serial0", "/dev/ttyUSB0"]
-BAUDS        = [921600, 460800, 230400, 115200]   # include 460800 (some firmwares)
+BAUDS        = [921600, 460800, 230400, 115200]   # includes 460800 (some firmwares)
 
 # Media (MP4 recommended; mpv also plays MP3/WAV)
-MEDIA_FILE   = Path("/home/pi/halloween/sounds/witch_laugh.mp4")
-SHOW_VIDEO   = True                 # True = show video; False = audio-only
-FULLSCREEN   = True                 # fullscreen when SHOW_VIDEO=True
-MPV_AUDIO_DEVICE = "alsa/plughw:1,0"  # set from `mpv --audio-device=help`, or None
-FORCE_DRM    = False                # True if running headless (no desktop), renders straight to HDMI
+MEDIA_FILE   = Path("/home/upi/halloween/sounds/video.mp4")
+SHOW_VIDEO   = True                  # True = show video; False = audio-only
+FULLSCREEN   = True                  # fullscreen when SHOW_VIDEO=True
+MPV_AUDIO_DEVICE = "alsa/plughw:1,0" # set from `mpv --audio-device=help`, or None for default
+MPV_VOLUME   = 100                   # 0..130 (mpv allows boost)
+FORCE_DRM    = False                 # True if running headless (no desktop), renders straight to HDMI
 
 # Zone: ONLY trigger when inside 1 mm .. 1 m (0.1..100 cm)
 ZONE_MIN_CM  = 0.1
@@ -40,7 +42,7 @@ FRAME_LEN  = 16
 
 # ---------- MEDIA PLAYBACK ----------
 def play_media_and_wait():
-    """Launch mpv, block until it finishes (so we don't re-trigger while playing)."""
+    """Launch mpv, BLOCK until it finishes (no re-triggers while playing)."""
     if not MEDIA_FILE.exists():
         print(f"[ERR] Missing media: {MEDIA_FILE}")
         return
@@ -48,7 +50,7 @@ def play_media_and_wait():
         print("[ERR] mpv not found. Install with: sudo apt update && sudo apt install -y mpv")
         return
 
-    cmd = ["mpv", "--no-config", "--really-quiet", "--no-terminal"]
+    cmd = ["mpv", "--no-config", "--no-terminal", "--really-quiet", f"--volume={MPV_VOLUME}"]
     if MPV_AUDIO_DEVICE:
         cmd += [f"--audio-device={MPV_AUDIO_DEVICE}"]
     if SHOW_VIDEO:
@@ -68,7 +70,6 @@ def play_media_and_wait():
         env["DISPLAY"] = ":0"
 
     try:
-        # Use run() to BLOCK here until the video completes
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, check=False)
     except Exception as e:
         print(f"[ERR] mpv run failed: {e}")
@@ -176,7 +177,6 @@ def main():
 
     try:
         while True:
-            # read & validate one frame
             fr = sync_and_read_frame(ser, timeout=1.0)
             if not fr:
                 continue
@@ -206,11 +206,10 @@ def main():
                 in_count += 1
                 if in_count >= ENTER_FRAMES:
                     print(f"[TRIGGER] {smoothed:.1f} cm → Play MP4 (blocking)")
-                    # Block here until the video finishes. While playing, we do NOTHING.
+                    # Block here until the video completes. While playing, do NOTHING.
                     play_media_and_wait()
 
-                    # When mpv exits, give the serial buffer a quick flush and a tiny cooldown,
-                    # then resume sensing fresh.
+                    # After mpv exits: flush serial input, brief cooldown, then resume sensing
                     try:
                         ser.reset_input_buffer()
                     except Exception:
