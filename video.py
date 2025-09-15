@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-# Nooploop TOFSense -> Witch Laugh (MP4 via mpv)
-# Zone: 1 mm .. 1 m, robust port/baud lock, auto distance offset, re-trigger option
+# Nooploop TOFSense -> MP4 scare player (blocks until video ends, then resume sensing)
+# Zone: 1 mm .. 1 m, robust port/baud lock, auto distance offset
 
-import serial, time, subprocess, statistics, shutil
+import serial, time, subprocess, statistics, shutil, os
 from pathlib import Path
 from collections import deque
 
 # ---------- USER CONFIG ----------
 # Serial: try GPIO UART first, then USB-TTL
 PORTS        = ["/dev/serial0", "/dev/ttyUSB0"]
-BAUDS        = [921600, 460800, 230400, 115200]   # includes 460800 (some firmwares)
+BAUDS        = [921600, 460800, 230400, 115200]   # include 460800 (some firmwares)
 
-# Media (MP4/MP3/WAV all ok with mpv)
+# Media (MP4 recommended; mpv also plays MP3/WAV)
 MEDIA_FILE   = Path("/home/pi/halloween/sounds/witch_laugh.mp4")
-SHOW_VIDEO   = False                               # False = audio only; True = show video on HDMI
-MPV_AUDIO_DEVICE = "alsa/plughw:1,0"               # run `mpv --audio-device=help` to confirm; or set to None
+SHOW_VIDEO   = True                 # True = show video; False = audio-only
+FULLSCREEN   = True                 # fullscreen when SHOW_VIDEO=True
+MPV_AUDIO_DEVICE = "alsa/plughw:1,0"  # set from `mpv --audio-device=help`, or None
+FORCE_DRM    = False                # True if running headless (no desktop), renders straight to HDMI
 
 # Zone: ONLY trigger when inside 1 mm .. 1 m (0.1..100 cm)
 ZONE_MIN_CM  = 0.1
@@ -22,15 +24,13 @@ ZONE_MAX_CM  = 100.0
 
 # Trigger behavior
 ENTER_FRAMES = 2           # consecutive in-zone frames required to fire
-EXIT_FRAMES  = 2           # consecutive out-of-zone frames to re-arm (used if RETRIGGER_ON_STAY=False)
-COOLDOWN_SEC = 4.0         # seconds between scares
-RETRIGGER_ON_STAY = True   # if True: re-fire after cooldown even if you don't leave the zone
+COOLDOWN_AFTER_END = 0.4   # brief pause after video ends (seconds)
 
 # Filters (start forgiving; tighten later when stable)
-MIN_SIGNAL   = 0           # set to ~15–30 after confirming it's working cleanly
+MIN_SIGNAL   = 0           # set to ~15–30 once confirmed working
 MIN_CM       = 0.1         # hard lower clamp (1 mm)
 MAX_CM       = 105.0       # hard upper clamp slightly above 1 m
-EMA_ALPHA    = 0.6         # higher = snappier response
+EMA_ALPHA    = 0.5         # higher = snappier response
 MED_WIN      = 3           # smaller window = less lag
 DEBUG_EVERY  = 1           # print every frame; set 0 when done tuning
 # ---------------------------------
@@ -39,7 +39,8 @@ HDR        = 0x57
 FRAME_LEN  = 16
 
 # ---------- MEDIA PLAYBACK ----------
-def play_media():
+def play_media_and_wait():
+    """Launch mpv, block until it finishes (so we don't re-trigger while playing)."""
     if not MEDIA_FILE.exists():
         print(f"[ERR] Missing media: {MEDIA_FILE}")
         return
@@ -47,19 +48,30 @@ def play_media():
         print("[ERR] mpv not found. Install with: sudo apt update && sudo apt install -y mpv")
         return
 
-    cmd = ["mpv", "--really-quiet", "--no-terminal", "--no-config"]
-    if not SHOW_VIDEO:
-        cmd += ["--no-video"]
+    cmd = ["mpv", "--no-config", "--really-quiet", "--no-terminal"]
     if MPV_AUDIO_DEVICE:
         cmd += [f"--audio-device={MPV_AUDIO_DEVICE}"]
+    if SHOW_VIDEO:
+        if FULLSCREEN:
+            cmd += ["--fs"]
+        if FORCE_DRM:
+            # render directly to HDMI when no desktop is running
+            cmd += ["--vo=gpu", "--gpu-context=drm"]
+    else:
+        cmd += ["--no-video"]
+
     cmd.append(str(MEDIA_FILE))
 
+    # Try to target the desktop display if SHOW_VIDEO and not forcing DRM
+    env = os.environ.copy()
+    if SHOW_VIDEO and not FORCE_DRM and "DISPLAY" not in env:
+        env["DISPLAY"] = ":0"
+
     try:
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        print("[ERR] Failed to run mpv. Is it installed?")
+        # Use run() to BLOCK here until the video completes
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, check=False)
     except Exception as e:
-        print(f"[ERR] mpv error: {e}")
+        print(f"[ERR] mpv run failed: {e}")
 
 # ---------- TOFSense FRAME UTILS ----------
 def sync_and_read_frame(ser, timeout=1.0):
@@ -160,20 +172,18 @@ def main():
     medbuf = deque(maxlen=MED_WIN)
     ema = None
     in_count = 0
-    out_count = 0
-    armed = True
-    last_play = 0.0
     dbg = 0
 
     try:
         while True:
+            # read & validate one frame
             fr = sync_and_read_frame(ser, timeout=1.0)
             if not fr:
                 continue
 
             dist_cm, status, signal = fields(fr, dist_offset)
 
-            # basic gates
+            # hard gates
             if status != 0 or dist_cm < MIN_CM or dist_cm > MAX_CM:
                 in_count = 0
                 continue
@@ -191,48 +201,32 @@ def main():
                 print(f"[DBG] raw={dist_cm:6.2f}cm  med={med:6.2f}  ema={smoothed:6.2f}  sig={signal:4d}  st={status}")
             dbg += 1
 
-            now = time.time()
-            inside = (ZONE_MIN_CM <= smoothed <= ZONE_MAX_CM)
+            # in-zone counting
+            if ZONE_MIN_CM <= smoothed <= ZONE_MAX_CM:
+                in_count += 1
+                if in_count >= ENTER_FRAMES:
+                    print(f"[TRIGGER] {smoothed:.1f} cm → Play MP4 (blocking)")
+                    # Block here until the video finishes. While playing, we do NOTHING.
+                    play_media_and_wait()
 
-            if RETRIGGER_ON_STAY:
-                # Re-fire after cooldown even if staying in the zone
-                if inside:
-                    in_count += 1
-                    if in_count >= ENTER_FRAMES and (now - last_play) >= COOLDOWN_SEC:
-                        print(f"[TRIGGER] {smoothed:.1f} cm in zone → Play MP4")
-                        play_media()
-                        last_play = now
-                        in_count = 0
-                else:
+                    # When mpv exits, give the serial buffer a quick flush and a tiny cooldown,
+                    # then resume sensing fresh.
+                    try:
+                        ser.reset_input_buffer()
+                    except Exception:
+                        pass
+                    time.sleep(COOLDOWN_AFTER_END)
                     in_count = 0
+                    ema = None
             else:
-                # Classic: trigger once, require exit to re-arm
-                if armed:
-                    if inside:
-                        in_count += 1
-                        if in_count >= ENTER_FRAMES and (now - last_play) >= COOLDOWN_SEC:
-                            print(f"[TRIGGER] {smoothed:.1f} cm in zone → Play MP4")
-                            play_media()
-                            last_play = now
-                            armed = False
-                            in_count = 0
-                            out_count = 0
-                    else:
-                        in_count = 0
-                else:
-                    if not inside:
-                        out_count += 1
-                        if out_count >= EXIT_FRAMES:
-                            armed = True
-                            out_count = 0
-                    else:
-                        out_count = 0
+                in_count = 0
 
     except KeyboardInterrupt:
         pass
     finally:
         try: ser.close()
         except Exception: pass
+
 
 if __name__ == "__main__":
     main()
